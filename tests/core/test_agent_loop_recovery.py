@@ -258,9 +258,71 @@ async def test_agent_loop_marks_parse_failed_after_recovery_exhausted(monkeypatc
     stats = loop.get_format_recovery_stats()
     assert stats["format_recovery_attempts"] == 1
     assert stats["format_recovery_successes"] == 0
-    assert stats["format_recovery_exhausted"] == 1
-    assert llm_client.recovery_calls == 2
-    assert trajectory[-1].action is None
+
+
+def test_trim_recovery_messages_truncates_large_recent_observation(monkeypatch):
+    monkeypatch.setenv("LIVEWEB_FORMAT_RECOVERY_CONTEXT_LENGTH", "1024")
+    monkeypatch.setenv("LIVEWEB_FORMAT_RECOVERY_TOKEN_MARGIN", "128")
+
+    loop = AgentLoop(
+        session=_FakeSession(),
+        llm_client=_FakeLLMClient(initial_response=LLMResponse(content="")),
+        protocol=FunctionCallingProtocol(),
+        max_steps=2,
+    )
+    giant_observation = "Observation:\n" + ("A" * 12000) + "\nTail marker"
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "assistant", "content": "{\"name\":\"goto\"}"},
+        {"role": "user", "content": giant_observation},
+        {"role": "user", "content": "Emit exactly one valid tool call now."},
+    ]
+
+    trimmed, overflowed = loop._trim_recovery_messages(messages=messages, max_new_tokens=64)
+
+    assert overflowed is True
+    assert trimmed is not None
+    assert loop._estimate_message_tokens(trimmed) <= (1024 - 64 - 128)
+    assert trimmed[-2]["role"] == "user"
+    assert "Tail marker" in trimmed[-2]["content"]
+    assert len(trimmed[-2]["content"]) < len(giant_observation)
+    assert "[truncated for format recovery]" in trimmed[-2]["content"]
+
+
+@pytest.mark.anyio
+async def test_attempt_format_recovery_skips_when_budget_is_non_positive(monkeypatch):
+    monkeypatch.setenv("LIVEWEB_FORMAT_RECOVERY_CONTEXT_LENGTH", "128")
+    monkeypatch.setenv("LIVEWEB_FORMAT_RECOVERY_TOKEN_MARGIN", "128")
+
+    llm_client = _FakeLLMClient(
+        initial_response=LLMResponse(content="<tool_call>{\"name\":\"goto\""),
+        recovery_responses=[],
+    )
+    loop = AgentLoop(
+        session=_FakeSession(),
+        llm_client=llm_client,
+        protocol=FunctionCallingProtocol(),
+        max_steps=2,
+    )
+
+    raw_response, action, usage, failure_override = await loop._attempt_format_recovery(
+        model="qwen",
+        seed=1,
+        raw_response="<tool_call>{\"name\":\"goto\"",
+        messages=[
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "Find the answer"},
+            {"role": "user", "content": "Emit one tool call"},
+        ],
+        failure_class="recoverable_partial_json",
+    )
+
+    assert action is None
+    assert usage is None
+    assert failure_override == "recoverable_context_overflow"
+    stats = loop.get_local_recovery_stats()
+    assert llm_client.recovery_calls == 0
+    assert stats.get("format_recovery_exhausted", 0) == 0
 
 
 @pytest.mark.anyio

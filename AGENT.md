@@ -62,6 +62,87 @@ Use this for:
 These tricks may improve runtime efficiency.
 They must not redefine final benchmark scoring.
 
+## Recovery Guardrails
+
+Recent RL debugging established several constraints that must not be forgotten.
+
+### Format Recovery Must Be Bounded
+
+`strict_eval`/`fast_collect` recovery paths may be used, but recovery must never
+be allowed to rebuild an effectively unbounded prompt.
+
+Current requirements:
+
+- recovery trimming must be token-aware, not only `len(content)//4`
+- the final observation/user message may be truncated or summarized if it alone
+  exceeds budget
+- recovery should prioritize:
+  - system prompt
+  - current task description
+  - the most recent 1-2 steps
+  - the recovery remediation message
+- recovery must not blindly retain long accessibility trees or the full raw
+  browser history
+
+### Recovery Overflow Must Fail Fast
+
+If recovery still exceeds budget or hits model-context limits, it must fail as a
+sample-level error, not continue retrying indefinitely.
+
+Expected classifications include:
+
+- `recoverable_context_overflow`
+- `format_recovery_overflow`
+- `llm_context_overflow`
+
+These should terminate the current recovery attempt quickly rather than sending
+another oversized request.
+
+### Long-Tail Protection Matters More Than Saving One Sample
+
+The most expensive historical RL failures came from a single bad trajectory
+triggering recovery, overflowing context, and then never being cleaned up
+properly downstream.
+
+When in doubt:
+
+- prefer early termination of the bad sample
+- do not preserve a pathological trajectory at the cost of blocking a whole
+  rollout round
+
+## Browser / Proxy Notes
+
+### Browser Proxy Is Allowed for External Sites
+
+Current downstream RL experiments intentionally allow the browser to use the
+system proxy for external websites, because direct access was measured to be
+materially slower for several important domains.
+
+Practical rule:
+
+- browser-side external traffic may use the system proxy
+- local control-plane traffic and local LLM traffic must not be forced through
+  that proxy
+
+Observed high-value domains where system proxy was measured faster than direct
+access on the current machine:
+
+- `taostats`
+- `coingecko`
+- `stooq`
+- `hackernews`
+
+### Proxy Logic Must Stay Explicit
+
+If browser proxy behavior changes, keep the decision path explicit and simple.
+Do not assume "inherit whatever the shell has" is always safe.
+
+In particular:
+
+- local service traffic should continue to honor `NO_PROXY`
+- proxy-specific code paths in browser setup must stay import-safe and
+  regression-tested
+
 ## Integration Contract
 
 Downstream benchmark code is expected to use:

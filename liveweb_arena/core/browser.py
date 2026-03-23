@@ -1,6 +1,7 @@
 """Browser engine with session isolation for concurrent evaluations"""
 
 import asyncio
+import os
 from dataclasses import asdict, dataclass, field
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 from typing import Any, Optional, TYPE_CHECKING
@@ -95,6 +96,18 @@ _TAOSTATS_LIST_SORT_SELECTORS = (
     'div.rt-th:has-text("1M")',
     'th:nth-child(7)',
 )
+
+
+def _browser_proxy_mode() -> str:
+    return os.getenv("LIVEWEB_BROWSER_PROXY_MODE", "system").strip().lower()
+
+
+def _browser_should_force_direct() -> bool:
+    return _browser_proxy_mode() in {"direct", "no_proxy", "off"}
+
+
+def _browser_should_direct_stooq() -> bool:
+    return os.getenv("LIVEWEB_BROWSER_STOOQ_DIRECT", "0") == "1"
 
 
 @dataclass
@@ -460,6 +473,8 @@ class BrowserSession:
         return bool(self._allowed_domains) and self._allowed_domains.issubset(_STOOQ_ONLY_DOMAINS)
 
     async def _switch_to_direct_stooq_browser(self) -> None:
+        if not _browser_should_direct_stooq():
+            return
         if self._stooq_transport_mode == "direct":
             return
 
@@ -1409,6 +1424,8 @@ class BrowserEngine:
             "--disable-dev-shm-usage",
             "--disable-gpu",
         ]
+        if _browser_should_force_direct() and "--no-proxy-server" not in self._browser_args:
+            self._browser_args.append("--no-proxy-server")
         self._dirty = False
 
     def _launch_options(self) -> dict[str, Any]:

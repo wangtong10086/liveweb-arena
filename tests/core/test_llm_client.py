@@ -68,8 +68,8 @@ class _FakeAsyncHTTPClient:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    async def post(self, url, json):
-        self._recorder.append((url, json))
+    async def post(self, url, json, headers=None):
+        self._recorder.append((url, json, headers or {}))
         return _FakeHTTPXResponse()
 
 
@@ -109,6 +109,36 @@ class _RateLimitThenSuccessCompletions:
 class _RateLimitThenSuccessOpenAI:
     def __init__(self, completions):
         self.chat = SimpleNamespace(completions=completions)
+
+    async def close(self):
+        return None
+
+
+class _ContextLimitThenSuccessCompletions:
+    def __init__(self, recorder):
+        self._recorder = recorder
+        self._calls = 0
+
+    async def create(self, **kwargs):
+        self._recorder.append(kwargs)
+        self._calls += 1
+        if self._calls == 1:
+            raise openai.BadRequestError(
+                "Requested token count exceeds the model's maximum context length of 32768 tokens. "
+                "You requested a total of 34078 tokens: 1310 tokens from the input messages and 32768 tokens "
+                "for the completion. Please reduce the number of tokens in the input messages or the completion "
+                "to fit within the limit."
+            )
+        return SimpleNamespace(
+            id=kwargs["extra_body"]["request_id"],
+            choices=[_FakeChoice(tool_calls=[_FakeToolCall("goto", '{"url":"https://example.com"}')])],
+            usage=_FakeResponseUsage(),
+        )
+
+
+class _ContextLimitThenSuccessOpenAI:
+    def __init__(self, recorder):
+        self.chat = SimpleNamespace(completions=_ContextLimitThenSuccessCompletions(recorder))
 
     async def close(self):
         return None
@@ -362,10 +392,12 @@ async def test_chat_with_tools_timeout_triggers_abort(monkeypatch):
 
     assert requests
     assert aborts
-    abort_url, abort_payload = aborts[0]
+    abort_url, abort_payload, abort_headers = aborts[0]
     assert abort_url == "http://127.0.0.1:31050/abort_request"
     assert abort_payload["rid"] == requests[0]["extra_body"]["request_id"]
     assert abort_payload["abort_all"] is False
+    assert abort_headers["Authorization"] == "Bearer local"
+    assert abort_headers["X-API-Key"] == "local"
 
 
 @pytest.mark.parametrize(
@@ -477,6 +509,35 @@ async def test_chat_with_tools_retries_on_rate_limit_even_in_strict_serial(monke
 
     assert isinstance(response, LLMResponse)
     assert len(requests) == 3
+
+
+@pytest.mark.anyio
+async def test_chat_with_tools_reduces_completion_cap_after_context_error(monkeypatch):
+    requests = []
+    completions = _ContextLimitThenSuccessCompletions(requests)
+    monkeypatch.setenv("LIVEWEB_MAX_COMPLETION_TOKENS", "32768")
+    monkeypatch.setattr(
+        "liveweb_arena.utils.llm_client.openai.AsyncOpenAI",
+        lambda **kwargs: _RateLimitThenSuccessOpenAI(completions),
+    )
+
+    client = LLMClient(base_url="http://127.0.0.1:31050/v1", api_key="local")
+    async def _noop_abort(*args, **kwargs):
+        return None
+    monkeypatch.setattr(client, "_abort_request", _noop_abort)
+    response = await client.chat_with_tools(
+        system="system",
+        user="user",
+        model="qwen",
+        tools=[{"type": "function", "function": {"name": "goto", "parameters": {"type": "object"}}}],
+        temperature=0.0,
+        timeout_s=5,
+    )
+
+    assert isinstance(response, LLMResponse)
+    assert len(requests) == 2
+    assert requests[0]["max_completion_tokens"] == 32768
+    assert requests[1]["max_completion_tokens"] < 32768
 
 
 @pytest.mark.anyio

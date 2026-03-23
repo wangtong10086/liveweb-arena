@@ -714,6 +714,109 @@ class AgentLoop:
                 total += 16
         return total
 
+    @staticmethod
+    def _truncate_recovery_content(
+        content: str,
+        *,
+        max_chars: int,
+        keep_head_ratio: float = 0.7,
+    ) -> str:
+        if len(content) <= max_chars:
+            return content
+        if max_chars <= 64:
+            return content[:max_chars]
+        head_chars = max(32, int(max_chars * keep_head_ratio))
+        tail_chars = max(16, max_chars - head_chars - 32)
+        if head_chars + tail_chars + 32 > max_chars:
+            tail_chars = max(16, max_chars - head_chars - 32)
+        marker = "\n...[truncated for format recovery]...\n"
+        return f"{content[:head_chars]}{marker}{content[-tail_chars:]}"
+
+    def _slim_recovery_message(
+        self,
+        message: dict[str, Any],
+        *,
+        index: int,
+        total: int,
+    ) -> dict[str, Any]:
+        slimmed = dict(message)
+        content = slimmed.get("content")
+        if not isinstance(content, str):
+            return slimmed
+
+        role = str(slimmed.get("role") or "")
+        max_chars = 1200
+        if index == 0 and role == "system":
+            max_chars = 4000
+        elif index >= total - 1:
+            max_chars = 800
+        elif index >= total - 2:
+            max_chars = 2500
+        elif role == "assistant":
+            max_chars = 900
+        slimmed["content"] = self._truncate_recovery_content(content, max_chars=max_chars)
+        return slimmed
+
+    def _shrink_recovery_messages_to_budget(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        budget: int,
+    ) -> list[dict[str, Any]] | None:
+        current = [dict(message) for message in messages]
+        if not current:
+            return current
+
+        protected_indices: set[int] = set()
+        if current and current[0].get("role") == "system":
+            protected_indices.add(0)
+        protected_indices.add(len(current) - 1)
+        if len(current) >= 2:
+            protected_indices.add(len(current) - 2)
+
+        while self._estimate_message_tokens(current) > budget:
+            largest_index = None
+            largest_size = 0
+            for idx, message in enumerate(current):
+                content = message.get("content")
+                if not isinstance(content, str):
+                    continue
+                if len(content) > largest_size:
+                    largest_index = idx
+                    largest_size = len(content)
+            if largest_index is None:
+                break
+
+            message = dict(current[largest_index])
+            content = message.get("content", "")
+            if not isinstance(content, str):
+                break
+
+            if len(content) > 256:
+                reduced = max(192, int(len(content) * 0.65))
+                message["content"] = self._truncate_recovery_content(content, max_chars=reduced)
+                current[largest_index] = message
+                continue
+
+            removable_indices = [
+                idx
+                for idx in range(len(current))
+                if idx not in protected_indices
+            ]
+            if not removable_indices:
+                return None
+            del current[removable_indices[0]]
+
+            protected_indices = {
+                idx if idx < removable_indices[0] else idx - 1
+                for idx in protected_indices
+                if idx != removable_indices[0]
+            }
+
+        if self._estimate_message_tokens(current) > budget:
+            return None
+        return current
+
     def _trim_recovery_messages(
         self,
         *,
@@ -723,39 +826,49 @@ class AgentLoop:
         budget = self._format_recovery_context_length - max_new_tokens - self._format_recovery_token_margin
         if budget <= 0:
             return None, True
-
-        protected_indices = []
-        if messages and messages[0].get("role") == "system":
-            protected_indices.append(0)
-        if len(messages) >= 2:
-            protected_indices.extend([len(messages) - 2, len(messages) - 1])
-        protected_indices = sorted(set(i for i in protected_indices if 0 <= i < len(messages)))
-
-        protected_messages = [messages[i] for i in protected_indices]
-        if self._estimate_message_tokens(protected_messages) > budget:
-            return None, True
-
-        middle_indices = [i for i in range(len(messages)) if i not in protected_indices]
-        kept_middle: list[dict] = []
-        current_messages = list(protected_messages)
-        current_tokens = self._estimate_message_tokens(current_messages)
-        for idx in reversed(middle_indices):
-            candidate = messages[idx]
-            candidate_tokens = self._estimate_message_tokens([candidate])
-            if current_tokens + candidate_tokens > budget:
-                continue
-            kept_middle.append(candidate)
-            current_tokens += candidate_tokens
-
-        rebuilt: list[dict] = []
-        protected_set = set(protected_indices)
-        kept_middle_ids = {id(msg) for msg in kept_middle}
-        for i, message in enumerate(messages):
-            if i in protected_set or id(message) in kept_middle_ids:
-                rebuilt.append(message)
-
         overflowed = self._estimate_message_tokens(messages) > budget
-        return rebuilt, overflowed
+        if not messages:
+            return [], overflowed
+
+        system_message = messages[0] if messages[0].get("role") == "system" else None
+        tail_keep = 4 if len(messages) >= 5 else len(messages)
+        trimmed_candidates: list[dict[str, Any]] = []
+        if system_message is not None:
+            trimmed_candidates.append(system_message)
+        trimmed_candidates.extend(messages[-tail_keep:])
+
+        deduped: list[dict[str, Any]] = []
+        seen_ids: set[int] = set()
+        for message in trimmed_candidates:
+            marker = id(message)
+            if marker in seen_ids:
+                continue
+            seen_ids.add(marker)
+            deduped.append(message)
+
+        slimmed = [
+            self._slim_recovery_message(message, index=index, total=len(deduped))
+            for index, message in enumerate(deduped)
+        ]
+        shrunk = self._shrink_recovery_messages_to_budget(messages=slimmed, budget=budget)
+        if shrunk is None:
+            return None, True
+        return shrunk, overflowed
+
+    @staticmethod
+    def _classify_recovery_exception(exc: Exception) -> str | None:
+        message = str(exc or "").lower()
+        if "recoverable_context_overflow" in message:
+            return "recoverable_context_overflow"
+        if (
+            "format recovery error" in message and "context length" in message
+        ) or "strict-serial format recovery error" in message:
+            return "format_recovery_overflow"
+        if "requested token count exceeds the model's maximum context length" in message:
+            return "llm_context_overflow"
+        if "longer than the model's context length" in message:
+            return "llm_context_overflow"
+        return None
 
     async def _attempt_format_recovery(
         self,
@@ -785,13 +898,24 @@ class AgentLoop:
             max_retries = min(max_retries, self._format_recovery_empty_max_retries)
 
         for retry_idx in range(max_retries):
-            response = await self._llm_client.chat_with_tools_recovery(
-                messages=base_messages,
-                model=model,
-                tools=tools,
-                seed=seed,
-                max_new_tokens=self._format_recovery_max_new_tokens,
-            )
+            try:
+                response = await self._llm_client.chat_with_tools_recovery(
+                    messages=base_messages,
+                    model=model,
+                    tools=tools,
+                    seed=seed,
+                    max_new_tokens=self._format_recovery_max_new_tokens,
+                )
+            except Exception as exc:
+                classified = self._classify_recovery_exception(exc)
+                if classified is not None:
+                    log(
+                        "Agent",
+                        f"Format recovery failed fast due to classified error={classified}: {exc}",
+                        force=True,
+                    )
+                    return raw_response, None, recovery_usage, classified
+                raise
             if response.usage:
                 for key in recovery_usage:
                     recovery_usage[key] += int(response.usage.get(key, 0) or 0)

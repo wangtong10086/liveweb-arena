@@ -42,6 +42,18 @@ DEFAULT_TTL = 48 * 3600
 _TEXT_CONTENT_SEPARATOR = "\n\n--- Page Text Content ---\n"
 
 
+def _browser_proxy_mode() -> str:
+    return os.environ.get("LIVEWEB_BROWSER_PROXY_MODE", "system").strip().lower()
+
+
+def _browser_should_force_direct() -> bool:
+    return _browser_proxy_mode() in {"direct", "no_proxy", "off"}
+
+
+def _browser_should_direct_stooq() -> bool:
+    return os.environ.get("LIVEWEB_BROWSER_STOOQ_DIRECT", "0") == "1"
+
+
 def _is_stooq_url(url: str) -> bool:
     return "stooq.com" in (urlparse(url).hostname or "").lower()
 
@@ -494,7 +506,7 @@ class CacheManager:
             "--disable-dev-shm-usage",
             "--disable-gpu",
         ]
-        if direct:
+        if direct or _browser_should_force_direct():
             args.append("--no-proxy-server")
         return {
             "headless": True,
@@ -974,7 +986,11 @@ class CacheManager:
         try:
             return await self._fetch_page_once(self._browser, url, plugin)
         except Exception as exc:
-            if not _is_stooq_url(url) or not _is_retryable_stooq_prefetch_error(exc):
+            if (
+                not _browser_should_direct_stooq()
+                or not _is_stooq_url(url)
+                or not _is_retryable_stooq_prefetch_error(exc)
+            ):
                 raise
             log("Cache", f"Retrying Stooq prefetch via direct browser: {type(exc).__name__}: {exc}")
             direct_browser = await self._playwright.chromium.launch(**self._browser_launch_options(direct=True))

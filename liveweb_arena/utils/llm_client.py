@@ -5,6 +5,7 @@ import email.utils
 import ipaddress
 import os
 import random
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -267,6 +268,12 @@ class LLMClient:
     DEFAULT_TIMEOUT = 600
     MAX_CHUNKS = int(os.getenv("LIVEWEB_LLM_MAX_CHUNKS", "32000"))
     _GLOBAL_RATE_LIMIT_UNTIL: Dict[str, float] = {}
+    _CONTEXT_LENGTH_DETAILS_RE = re.compile(
+        r"maximum context length of (\d+) tokens.*?"
+        r"requested a total of (\d+) tokens:\s*"
+        r"(\d+) tokens from the input messages and (\d+) tokens for the completion",
+        re.IGNORECASE | re.DOTALL,
+    )
 
     def __init__(
         self,
@@ -369,6 +376,35 @@ class LLMClient:
         except ValueError:
             log("LLM", f"Invalid {name}={raw!r}; using default {default}")
             return default
+
+    @classmethod
+    def _extract_context_length_details(cls, message: str) -> Optional[Tuple[int, int, int, int]]:
+        match = cls._CONTEXT_LENGTH_DETAILS_RE.search(message)
+        if not match:
+            return None
+        return tuple(int(group) for group in match.groups())
+
+    @classmethod
+    def _compute_reduced_completion_cap(
+        cls,
+        *,
+        error: Exception,
+        current_cap: Optional[int],
+    ) -> Optional[int]:
+        details = cls._extract_context_length_details(str(error))
+        if details is None:
+            return None
+
+        context_limit, _requested_total, prompt_tokens, requested_completion = details
+        reserve_tokens = max(64, min(512, context_limit // 64))
+        safe_cap = context_limit - prompt_tokens - reserve_tokens
+        if current_cap is not None:
+            safe_cap = min(safe_cap, current_cap - 1)
+        else:
+            safe_cap = min(safe_cap, requested_completion - 1)
+        if safe_cap < 16:
+            return None
+        return safe_cap
 
     @staticmethod
     def _is_openrouter_base_url(base_url: str) -> bool:
@@ -558,6 +594,11 @@ class LLMClient:
             return
 
         abort_url = f"{self._server_root_url(lease.base_url)}/abort_request"
+        headers = {
+            "Content-Type": "application/json; charset=utf-8",
+            "Authorization": f"Bearer {lease.api_key}",
+            "X-API-Key": lease.api_key,
+        }
         try:
             async with self._build_httpx_client(
                 base_url=lease.base_url,
@@ -570,6 +611,7 @@ class LLMClient:
                         "abort_all": False,
                         "abort_message": reason[:200],
                     },
+                    headers=headers,
                 )
                 if response.status_code == 200:
                     log("LLM", f"Abort requested for {request_id} on {lease.server_id}")
@@ -600,6 +642,7 @@ class LLMClient:
         last_error = None
         attempt = 0
         rate_limit_attempt = 0
+        max_completion_tokens_override = None
         while True:
             lease = None
             request_id = None
@@ -617,6 +660,7 @@ class LLMClient:
                         seed=seed,
                         timeout_s=actual_timeout,
                         request_id=request_id,
+                        max_completion_tokens_override=max_completion_tokens_override,
                     ),
                     timeout=actual_timeout,
                 )
@@ -679,7 +723,36 @@ class LLMClient:
                 if lease is not None:
                     await self._release_lease(lease, success=False, latency_s=time.time() - request_start)
                 error_msg = str(e).lower()
-                if "is longer than the model" in error_msg or "context_length_exceeded" in error_msg:
+                has_context_details = self._extract_context_length_details(str(e)) is not None
+                if (
+                    "is longer than the model" in error_msg
+                    or "context_length_exceeded" in error_msg
+                    or "maximum context length" in error_msg
+                    or has_context_details
+                ):
+                    reduced_cap = self._compute_reduced_completion_cap(
+                        error=e,
+                        current_cap=(
+                            max_completion_tokens_override
+                            if max_completion_tokens_override is not None
+                            else self._max_completion_tokens
+                        ),
+                    )
+                    if reduced_cap is not None:
+                        current_cap = (
+                            max_completion_tokens_override
+                            if max_completion_tokens_override is not None
+                            else self._max_completion_tokens
+                        )
+                        if current_cap is not None and reduced_cap >= current_cap:
+                            raise LLMFatalError(
+                                f"Token limit exceeded without room to reduce completion cap: {e}",
+                                original_error=e,
+                                attempts=attempt + 1,
+                            )
+                        max_completion_tokens_override = reduced_cap
+                        log("LLM", f"Retrying with reduced max_completion_tokens={reduced_cap} after context error")
+                        continue
                     log("LLM", f"Token limit exceeded - fatal error: {e}", force=True)
                     raise LLMFatalError(
                         f"Token limit exceeded: {e}",
@@ -736,7 +809,12 @@ class LLMClient:
                 if lease is not None:
                     await self._release_lease(lease, success=False, latency_s=time.time() - request_start)
                 error_msg = str(e).lower()
-                if "is longer than the model" in error_msg or "context_length_exceeded" in error_msg:
+                if (
+                    "is longer than the model" in error_msg
+                    or "context_length_exceeded" in error_msg
+                    or "maximum context length" in error_msg
+                    or self._extract_context_length_details(str(e)) is not None
+                ):
                     log("LLM", f"Token limit exceeded - fatal error: {e}", force=True)
                     raise LLMFatalError(
                         f"Token limit exceeded: {e}",
@@ -776,6 +854,7 @@ class LLMClient:
         last_error = None
         attempt = 0
         rate_limit_attempt = 0
+        max_completion_tokens_override = None
         while True:
             lease = None
             request_id = None
@@ -796,6 +875,7 @@ class LLMClient:
                         seed=seed,
                         timeout_s=actual_timeout,
                         request_id=request_id,
+                        max_completion_tokens_override=max_completion_tokens_override,
                     ),
                     timeout=actual_timeout,
                 )
@@ -862,7 +942,36 @@ class LLMClient:
                 if lease is not None:
                     await self._release_lease(lease, success=False, latency_s=time.time() - request_start)
                 error_msg = str(e).lower()
-                if "is longer than the model" in error_msg or "context_length_exceeded" in error_msg:
+                has_context_details = self._extract_context_length_details(str(e)) is not None
+                if (
+                    "is longer than the model" in error_msg
+                    or "context_length_exceeded" in error_msg
+                    or "maximum context length" in error_msg
+                    or has_context_details
+                ):
+                    reduced_cap = self._compute_reduced_completion_cap(
+                        error=e,
+                        current_cap=(
+                            max_completion_tokens_override
+                            if max_completion_tokens_override is not None
+                            else self._max_completion_tokens
+                        ),
+                    )
+                    if reduced_cap is not None:
+                        current_cap = (
+                            max_completion_tokens_override
+                            if max_completion_tokens_override is not None
+                            else self._max_completion_tokens
+                        )
+                        if current_cap is not None and reduced_cap >= current_cap:
+                            raise LLMFatalError(
+                                f"Token limit exceeded without room to reduce completion cap: {e}",
+                                original_error=e,
+                                attempts=attempt + 1,
+                            )
+                        max_completion_tokens_override = reduced_cap
+                        log("LLM", f"Retrying with reduced max_completion_tokens={reduced_cap} after context error")
+                        continue
                     raise LLMFatalError(f"Token limit exceeded: {e}", original_error=e, attempts=attempt + 1)
                 raise
 
@@ -930,7 +1039,12 @@ class LLMClient:
                 if lease is not None:
                     await self._release_lease(lease, success=False, latency_s=time.time() - request_start)
                 error_msg = str(e).lower()
-                if "is longer than the model" in error_msg or "context_length_exceeded" in error_msg:
+                if (
+                    "is longer than the model" in error_msg
+                    or "context_length_exceeded" in error_msg
+                    or "maximum context length" in error_msg
+                    or self._extract_context_length_details(str(e)) is not None
+                ):
                     raise LLMFatalError(f"Token limit exceeded: {e}", original_error=e, attempts=attempt + 1)
                 last_error = e
                 if self._strict_serial:
@@ -1182,6 +1296,7 @@ class LLMClient:
         seed: Optional[int],
         timeout_s: int,
         request_id: str,
+        max_completion_tokens_override: Optional[int] = None,
     ) -> Tuple[str, Optional[dict]]:
         timeout_config = httpx.Timeout(
             connect=30.0,
@@ -1209,10 +1324,15 @@ class LLMClient:
             }
             if seed is not None:
                 params["seed"] = seed
-            if self._max_completion_tokens is not None:
+            effective_max_completion_tokens = (
+                max_completion_tokens_override
+                if max_completion_tokens_override is not None
+                else self._max_completion_tokens
+            )
+            if effective_max_completion_tokens is not None:
                 # Pass both names for compatibility across OpenAI-compatible servers.
-                params["max_tokens"] = self._max_completion_tokens
-                params["max_completion_tokens"] = self._max_completion_tokens
+                params["max_tokens"] = effective_max_completion_tokens
+                params["max_completion_tokens"] = effective_max_completion_tokens
             params["extra_body"] = {"request_id": request_id}
             self._apply_reasoning_controls(params, base_url=base_url, model=model)
 
