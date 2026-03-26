@@ -157,6 +157,19 @@ Downstream benchmark code is expected to use:
 The arena runtime profile controls execution only.
 Final benchmark semantics come from the downstream strict judge.
 
+## Testing Rule
+
+When running Python tests, smoke checks, or validation scripts, prefer `uv`
+entry points over bare `python` / `pytest`.
+
+Practical rule:
+
+- prefer `uv run ...` for Python-based tests and validation commands
+- if a project-specific interpreter is required for browser/runtime
+  dependencies, still invoke it through `uv` when possible
+- if `uv` cannot be used for a specific command, document the exception and the
+  reason in the task notes or run overview
+
 ## Online-Aligned Reference
 
 The current online-aligned `LIVEWEB` definition is derived from:
